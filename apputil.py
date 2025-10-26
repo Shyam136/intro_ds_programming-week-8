@@ -1,4 +1,4 @@
-# apputil.py
+# MarkovText (updated)
 from __future__ import annotations
 from collections import defaultdict
 import re
@@ -17,14 +17,23 @@ class MarkovText:
     ----------
     corpus : str
         Text corpus (single string). Tokenization is whitespace-based with light punctuation stripping.
+
+    Attributes
+    ----------
+    tokens : List[str]         # tokenized corpus
+    term_dict : Dict[State, List[str]]   # first-order term dict (k=1)
+    term_dict_cache : Dict[int, Dict]    # cached dicts for other k values
     """
 
     def __init__(self, corpus: str):
         if not isinstance(corpus, str):
             raise TypeError("corpus must be a string")
         self.corpus = corpus.strip()
-        self._tokens: List[Token] = self._tokenize(self.corpus)
+        self.tokens: List[Token] = self._tokenize(self.corpus)
+        # cache for k-specific dictionaries
         self.term_dict_cache: Dict[int, Dict[State, List[Token]]] = {}
+        # build default (k=1) term_dict attribute so tests can access mt.term_dict
+        self.term_dict = self.get_term_dict(k=1)
 
     # -------------------------
     # Tokenization
@@ -34,17 +43,14 @@ class MarkovText:
         """
         Basic tokenization:
         - normalize whitespace
-        - remove most punctuation except internal apostrophes (e.g., don't)
+        - remove most punctuation except internal apostrophes/dashes
         - split on whitespace
         """
-        # normalize whitespace
+        if not text:
+            return []
         s = re.sub(r"\s+", " ", text).strip()
-        # remove punctuation except apostrophe and dash (keep contractions)
-        s = re.sub(r"[\"“”(),.:;!?—\[\]{}<>«»]", "", s)
-        # split
-        tokens = s.split(" ")
-        # remove empty tokens and strip
-        tokens = [t.strip() for t in tokens if t.strip()]
+        s = re.sub(r"[\"“”\(\)\[\]\{\}:;,.!?<>«»]", "", s)  # remove these punctuation chars
+        tokens = [t.strip() for t in s.split(" ") if t.strip()]
         return tokens
 
     # -------------------------
@@ -71,98 +77,132 @@ class MarkovText:
         if use_cache and k in self.term_dict_cache:
             return self.term_dict_cache[k]
 
-        tokens = self._tokens
-        term_dict: Dict[State, List[Token]] = defaultdict(list)
-
-        # Build sliding window
+        tokens = self.tokens
+        term_dict_local: Dict[State, List[Token]] = defaultdict(list)
         n = len(tokens)
         if n == 0:
             self.term_dict_cache[k] = {}
+            # if k==1, also set attribute
+            if k == 1:
+                self.term_dict = {}
             return {}
 
-        # iterate through tokens; for index i, state is tokens[i:i+k], follower is tokens[i+k]
+        # Build sliding windows: for i in [0 .. n-k-1], state=tokens[i:i+k], follower=tokens[i+k]
         for i in range(n - k):
-            if k == 1:
-                state = tokens[i]
-            else:
-                state = tuple(tokens[i:i + k])
+            state = tokens[i] if k == 1 else tuple(tokens[i : i + k])
             follower = tokens[i + k]
-            term_dict[state].append(follower)  # include duplicates to preserve frequency
+            term_dict_local[state].append(follower)  # keep duplicates to preserve empirical distribution
 
-        # Optionally store terminal state with no follower? We'll leave absent; handle in generate().
-        # Cache and return
-        self.term_dict_cache[k] = dict(term_dict)
-        return self.term_dict_cache[k]
+        term_dict_out = dict(term_dict_local)
+        self.term_dict_cache[k] = term_dict_out
+
+        # keep first-order as attribute for convenience
+        if k == 1:
+            self.term_dict = term_dict_out
+
+        return term_dict_out
 
     # -------------------------
     # Text generation
     # -------------------------
-    def generate(self, term_count: int = 50, seed_term: str | None = None, k: int = 1) -> str:
+    def generate(self, term_count: int = 50, seed_term: Union[str, Tuple[str, ...], None] = None, k: int = 1) -> str:
         """
         Generate text using the k-order Markov chain.
 
         Parameters
         ----------
         term_count : int
-            Number of tokens to generate (not including initial seed if provided).
-        seed_term : str or None
-            Optional starting token (for k=1) or space-separated k-token string (for k>1).
-            If provided and not found in the corpus, raises ValueError.
+            TOTAL number of tokens to return (the final string will contain exactly `term_count` tokens).
+        seed_term : str | tuple | None
+            Optional seed state:
+              - if k==1: seed_term may be a single token string
+              - if k>1: seed_term may be a whitespace-separated string of k tokens OR a tuple/list of k tokens
+            If seed_term is provided but not found among available states, ValueError is raised.
         k : int
-            Markov order (context length).
+            Markov order (context length)
 
         Returns
         -------
-        Generated text string
+        Generated text string with exactly `term_count` tokens (unless corpus empty, then empty string).
         """
+        # validate & coerce term_count
+        try:
+            term_count = int(term_count)
+        except Exception as e:
+            raise ValueError("term_count must be an integer or convertible to int") from e
         if term_count <= 0:
             return ""
+
+        if not isinstance(k, int) or k < 1:
+            raise ValueError("k must be an int >= 1")
 
         term_dict = self.get_term_dict(k=k)
         if not term_dict:
             return ""
 
-        # Build initial state
+        # build initial state
         if seed_term is None:
-            # choose random state from available keys
+            # pick a random starting state from keys
             state = np.random.choice(list(term_dict.keys()))
+            # normalize to tuple for k>1, or to token for k==1
         else:
-            # parse seed for k
+            # allow tuple/list seeds for k>1 or whitespace strings
             if k == 1:
-                state_candidate: State = seed_term
+                # ensure seed is a string token
+                if not isinstance(seed_term, str):
+                    raise ValueError("For k=1 seed_term must be a string token")
+                candidate_state = seed_term
             else:
-                parts = seed_term.split()
-                if len(parts) != k:
-                    raise ValueError(f"seed_term must contain exactly {k} tokens (space separated) when k={k}")
-                state_candidate = tuple(parts)
+                # permit tuple/list or whitespace-separated string
+                if isinstance(seed_term, (tuple, list)):
+                    if len(seed_term) != k:
+                        raise ValueError(f"seed_term tuple/list must have length {k}")
+                    candidate_state = tuple(str(x) for x in seed_term)
+                elif isinstance(seed_term, str):
+                    parts = seed_term.split()
+                    if len(parts) != k:
+                        raise ValueError(f"seed_term must contain exactly {k} tokens (space-separated) when k={k}")
+                    candidate_state = tuple(parts)
+                else:
+                    raise ValueError("seed_term must be a tuple/list of tokens or a whitespace-separated string")
 
-            # validate presence
-            if state_candidate not in term_dict:
+            if candidate_state not in term_dict:
                 raise ValueError("seed_term not found in corpus states")
-            state = state_candidate
+            state = candidate_state
 
+        # initialize generated list to reflect starting state but ensure final length == term_count
         generated: List[str] = []
-        # If initial state is a tuple, extend generated with its tokens (so output starts sensibly)
         if isinstance(state, tuple):
             generated.extend(list(state))
         else:
             generated.append(state)
 
-        # now iteratively sample followers
-        for _ in range(term_count):
+        # If starting tokens longer than requested term_count -> error
+        if len(generated) > term_count:
+            raise ValueError("seed_term contains more tokens than term_count")
+
+        # produce tokens until we reach exactly term_count length
+        while len(generated) < term_count:
             followers = term_dict.get(state, [])
             if not followers:
-                # no followers for this state; stop early
-                break
-            # sample according to empirical frequency
+                # fallback: pick a random state and continue so we don't stop early
+                state = np.random.choice(list(term_dict.keys()))
+                # if state is tuple, ensure tokens added appropriately in next iteration
+                # in this iteration we don't append state tokens (we keep current generated), but we need a follower to pick
+                followers = term_dict.get(state, [])
+                if not followers:
+                    # extremely degenerate: continue to next random pick
+                    continue
             next_token = np.random.choice(followers)
             generated.append(next_token)
-
             # advance state
             if k == 1:
                 state = next_token
             else:
-                # shift tuple left and append next_token
-                state = tuple(list(state[1:]) + [next_token])
+                # shift and append
+                if isinstance(state, tuple):
+                    state = tuple(list(state[1:]) + [next_token])
+                else:
+                    state = tuple([state, next_token])  # should not happen for k>1 but safe
 
         return " ".join(generated)
