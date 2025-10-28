@@ -1,9 +1,9 @@
-# MarkovText (updated)
+# MarkovText (final, clean version)
 from __future__ import annotations
 from collections import defaultdict
 import re
 import numpy as np
-from typing import List, Dict, Tuple, Union, Iterable
+from typing import List, Dict, Tuple, Union
 
 Token = str
 State = Union[Token, Tuple[Token, ...]]
@@ -49,7 +49,7 @@ class MarkovText:
         if not text:
             return []
         s = re.sub(r"\s+", " ", text).strip()
-        s = re.sub(r"[\"“”\(\)\[\]\{\}:;,.!?<>«»]", "", s)  # remove these punctuation chars
+        s = re.sub(r"[\"“”\(\)\[\]\{\}:;,.!?<>«»]", "", s)  # remove punctuation
         tokens = [t.strip() for t in s.split(" ") if t.strip()]
         return tokens
 
@@ -59,17 +59,6 @@ class MarkovText:
     def get_term_dict(self, k: int = 1, use_cache: bool = True) -> Dict[State, List[Token]]:
         """
         Build and return a term dictionary mapping states -> list of following tokens.
-
-        Parameters
-        ----------
-        k : int
-            Context size (k=1 => single-token state). For k>1, keys are tuples of length k.
-        use_cache : bool
-            If True, reuse cached dict for the same k.
-
-        Returns
-        -------
-        dict: { state -> [followers...] } with duplicates included (empirical counts preserved)
         """
         if not isinstance(k, int) or k < 1:
             raise ValueError("k must be an integer >= 1")
@@ -82,21 +71,18 @@ class MarkovText:
         n = len(tokens)
         if n == 0:
             self.term_dict_cache[k] = {}
-            # if k==1, also set attribute
             if k == 1:
                 self.term_dict = {}
             return {}
 
-        # Build sliding windows: for i in [0 .. n-k-1], state=tokens[i:i+k], follower=tokens[i+k]
         for i in range(n - k):
             state = tokens[i] if k == 1 else tuple(tokens[i : i + k])
             follower = tokens[i + k]
-            term_dict_local[state].append(follower)  # keep duplicates to preserve empirical distribution
+            term_dict_local[state].append(follower)
 
         term_dict_out = dict(term_dict_local)
         self.term_dict_cache[k] = term_dict_out
 
-        # keep first-order as attribute for convenience
         if k == 1:
             self.term_dict = term_dict_out
 
@@ -105,95 +91,91 @@ class MarkovText:
     # -------------------------
     # Text generation
     # -------------------------
-    def generate(self, term_count: int = 50, seed_term: Union[str, Tuple[str, ...], None] = None, k: int = 1) -> str:
+    def generate(
+        self,
+        term_count: int = 50,
+        seed_term: Union[str, Tuple[str, ...], None] = None,
+        k: int = 1
+    ) -> str:
         """
         Generate text using the k-order Markov chain.
-
-        term_count : int
-            TOTAL number of tokens to return (the final string will contain exactly `term_count` tokens).
-        seed_term : str | tuple | None
-            Optional seed state (see class doc for allowed formats).
-        k : int
-            Markov order (context length)
         """
-    # ---- robust term_count conversion ----
-    try:
-        arr = np.asarray(term_count)
-        if arr.size == 1:
-            # handle numpy/pandas scalar or 0-d array
-            term_count = int(np.asscalar(arr) if hasattr(np, "asscalar") else int(arr.item()))
-        else:
-            # multi-element array is invalid
-            raise ValueError("term_count must be a scalar integer or convertible to int")
-    except Exception:
-        # final fallback: try float->int conversion for strings like "20"
+
+        # ---- robust term_count conversion ----
         try:
-            term_count = int(float(term_count))
-        except Exception as e:
-            raise ValueError("term_count must be an integer or convertible to int") from e
-
-    if term_count <= 0:
-        return ""
-
-    if not isinstance(k, int) or k < 1:
-        raise ValueError("k must be an int >= 1")
-
-    term_dict = self.get_term_dict(k=k)
-    if not term_dict:
-        return ""
-
-    # build initial state
-    if seed_term is None:
-        state = np.random.choice(list(term_dict.keys()))
-    else:
-        # normalize seed_term for k==1 or k>1 (same logic as before)
-        if k == 1:
-            if not isinstance(seed_term, str):
-                raise ValueError("For k=1 seed_term must be a string token")
-            candidate_state = seed_term
-        else:
-            if isinstance(seed_term, (tuple, list)):
-                if len(seed_term) != k:
-                    raise ValueError(f"seed_term tuple/list must have length {k}")
-                candidate_state = tuple(str(x) for x in seed_term)
-            elif isinstance(seed_term, str):
-                parts = seed_term.split()
-                if len(parts) != k:
-                    raise ValueError(f"seed_term must contain exactly {k} tokens (space-separated) when k={k}")
-                candidate_state = tuple(parts)
+            arr = np.asarray(term_count)
+            if arr.size == 1:
+                try:
+                    term_count = int(arr.item())
+                except Exception:
+                    term_count = int(arr.tolist())
             else:
-                raise ValueError("seed_term must be a tuple/list of tokens or a whitespace-separated string")
+                raise ValueError("term_count must be a scalar integer or convertible to int")
+        except Exception:
+            try:
+                term_count = int(float(term_count))
+            except Exception as e:
+                raise ValueError("term_count must be an integer or convertible to int") from e
 
-        if candidate_state not in term_dict:
-            raise ValueError("seed_term not found in corpus states")
-        state = candidate_state
+        if term_count <= 0:
+            return ""
 
-    # initialize generated list to reflect starting state but ensure final length == term_count
-    generated: List[str] = []
-    if isinstance(state, tuple):
-        generated.extend(list(state))
-    else:
-        generated.append(state)
+        if not isinstance(k, int) or k < 1:
+            raise ValueError("k must be an int >= 1")
 
-    if len(generated) > term_count:
-        raise ValueError("seed_term contains more tokens than term_count")
+        term_dict = self.get_term_dict(k=k)
+        if not term_dict:
+            return ""
 
-    # produce tokens until we reach exactly term_count length
-    while len(generated) < term_count:
-        followers = term_dict.get(state, [])
-        if not followers:
-            # fallback: pick a random existing state and continue
+        # build initial state
+        if seed_term is None:
             state = np.random.choice(list(term_dict.keys()))
+        else:
+            if k == 1:
+                if not isinstance(seed_term, str):
+                    raise ValueError("For k=1 seed_term must be a string token")
+                candidate_state = seed_term
+            else:
+                if isinstance(seed_term, (tuple, list)):
+                    if len(seed_term) != k:
+                        raise ValueError(f"seed_term tuple/list must have length {k}")
+                    candidate_state = tuple(str(x) for x in seed_term)
+                elif isinstance(seed_term, str):
+                    parts = seed_term.split()
+                    if len(parts) != k:
+                        raise ValueError(f"seed_term must contain exactly {k} tokens when k={k}")
+                    candidate_state = tuple(parts)
+                else:
+                    raise ValueError("seed_term must be a tuple/list or space-separated string")
+
+            if candidate_state not in term_dict:
+                raise ValueError("seed_term not found in corpus states")
+            state = candidate_state
+
+        # initialize generated sequence
+        generated: List[str] = []
+        if isinstance(state, tuple):
+            generated.extend(list(state))
+        else:
+            generated.append(state)
+
+        if len(generated) > term_count:
+            raise ValueError("seed_term contains more tokens than term_count")
+
+        # produce tokens until we reach exactly term_count
+        while len(generated) < term_count:
             followers = term_dict.get(state, [])
             if not followers:
-                continue
-        next_token = np.random.choice(followers)
-        generated.append(next_token)
-        # advance state
-        if k == 1:
-            state = next_token
-        else:
-            state = tuple(list(state[1:]) + [next_token])
+                state = np.random.choice(list(term_dict.keys()))
+                followers = term_dict.get(state, [])
+                if not followers:
+                    break
+            next_token = np.random.choice(followers)
+            generated.append(next_token)
 
-    return " ".join(generated)
+            if k == 1:
+                state = next_token
+            else:
+                state = tuple(list(state[1:]) + [next_token])
 
+        return " ".join(generated)
